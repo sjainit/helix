@@ -43,6 +43,7 @@ import org.apache.helix.InstanceType;
 import org.apache.helix.PropertyPathBuilder;
 import org.apache.helix.TestHelper;
 import org.apache.helix.controller.rebalancer.waged.WagedRebalancer;
+import org.apache.helix.guardrail.rules.RequiredIdealStateFieldsGuardrailRule;
 import org.apache.helix.model.ClusterConfig;
 import org.apache.helix.model.CustomizedView;
 import org.apache.helix.model.ExternalView;
@@ -698,6 +699,119 @@ public class TestResourceAccessor extends AbstractTestClass {
     HelixDataAccessor helixDataAccessor = helixManager.getHelixDataAccessor();
     helixDataAccessor.setProperty(helixDataAccessor.keyBuilder().externalView(resourceName),
         externalView);
+    System.out.println("End test :" + TestHelper.getTestMethodName());
+  }
+
+  /*
+   * Guard rail coverage for the plain addResource endpoint. The endpoint writes a posted IdealState
+   * straight to ZooKeeper without ever calling IdealState#isValid(), so a record that omits a
+   * required field (here NUM_PARTITIONS) would otherwise be accepted and only fail later at
+   * rebalance time. These tests post such a record and assert the guard rail's block / dryRun /
+   * force behavior. The valid case confirms a complete record still passes.
+   */
+  @Test
+  public void testAddResourceRequiredFieldsGuardrailBlocks() throws IOException {
+    System.out.println("Start test :" + TestHelper.getTestMethodName());
+    String resourceName = "guardrailRequiredFieldsBlocked";
+
+    // IdealState with a state model but no NUM_PARTITIONS: getNumPartitions() == -1.
+    IdealState missing = new IdealState(resourceName);
+    missing.setStateModelDefRef("OnlineOffline");
+    Entity entity = Entity.entity(OBJECT_MAPPER.writeValueAsString(missing.getRecord()),
+        MediaType.APPLICATION_JSON_TYPE);
+
+    Response response = target("clusters/" + CLUSTER_NAME + "/resources/" + resourceName).request()
+        .put(entity);
+    Assert.assertEquals(response.getStatus(), Response.Status.BAD_REQUEST.getStatusCode());
+
+    JsonNode verdict = OBJECT_MAPPER.readTree(response.readEntity(String.class));
+    Assert.assertFalse(verdict.get("feasible").asBoolean());
+    Assert.assertTrue(verdict.toString().contains(RequiredIdealStateFieldsGuardrailRule.RULE_ID));
+
+    // A blocked request must not have created the resource.
+    Assert.assertFalse(_gSetupTool.getClusterManagementTool().getResourcesInCluster(CLUSTER_NAME)
+        .contains(resourceName));
+    System.out.println("End test :" + TestHelper.getTestMethodName());
+  }
+
+  @Test
+  public void testAddResourceRequiredFieldsGuardrailDryRun() throws IOException {
+    System.out.println("Start test :" + TestHelper.getTestMethodName());
+    String resourceName = "guardrailRequiredFieldsDryRun";
+
+    IdealState missing = new IdealState(resourceName);
+    missing.setStateModelDefRef("OnlineOffline");
+    Entity entity = Entity.entity(OBJECT_MAPPER.writeValueAsString(missing.getRecord()),
+        MediaType.APPLICATION_JSON_TYPE);
+
+    // dryRun only simulates: it always returns 200 with the verdict and never writes.
+    Response response = target("clusters/" + CLUSTER_NAME + "/resources/" + resourceName)
+        .queryParam("dryRun", true).request().put(entity);
+    Assert.assertEquals(response.getStatus(), Response.Status.OK.getStatusCode());
+
+    JsonNode verdict = OBJECT_MAPPER.readTree(response.readEntity(String.class));
+    Assert.assertFalse(verdict.get("feasible").asBoolean());
+    Assert.assertTrue(verdict.toString().contains(RequiredIdealStateFieldsGuardrailRule.RULE_ID));
+
+    Assert.assertFalse(_gSetupTool.getClusterManagementTool().getResourcesInCluster(CLUSTER_NAME)
+        .contains(resourceName));
+    System.out.println("End test :" + TestHelper.getTestMethodName());
+  }
+
+  @Test
+  public void testAddResourceRequiredFieldsGuardrailForceBypass() throws IOException {
+    System.out.println("Start test :" + TestHelper.getTestMethodName());
+    String resourceName = "guardrailRequiredFieldsForce";
+
+    IdealState missing = new IdealState(resourceName);
+    missing.setStateModelDefRef("OnlineOffline");
+    Entity entity = Entity.entity(OBJECT_MAPPER.writeValueAsString(missing.getRecord()),
+        MediaType.APPLICATION_JSON_TYPE);
+
+    try {
+      // force=true bypasses the guard rail and lets the (still invalid) resource be written.
+      Response response = target("clusters/" + CLUSTER_NAME + "/resources/" + resourceName)
+          .queryParam("force", true).request().put(entity);
+      Assert.assertEquals(response.getStatus(), Response.Status.OK.getStatusCode());
+
+      // The write actually happened, confirming the request got past the guard rail.
+      Assert.assertTrue(_gSetupTool.getClusterManagementTool().getResourcesInCluster(CLUSTER_NAME)
+          .contains(resourceName));
+    } finally {
+      if (_gSetupTool.getClusterManagementTool().getResourcesInCluster(CLUSTER_NAME)
+          .contains(resourceName)) {
+        _gSetupTool.getClusterManagementTool().dropResource(CLUSTER_NAME, resourceName);
+      }
+    }
+    System.out.println("End test :" + TestHelper.getTestMethodName());
+  }
+
+  @Test
+  public void testAddResourceRequiredFieldsGuardrailValidPasses() throws IOException {
+    System.out.println("Start test :" + TestHelper.getTestMethodName());
+    String resourceName = "guardrailRequiredFieldsValid";
+
+    // A complete IdealState carrying both required fields must pass the guard rail.
+    IdealState valid = new IdealState(resourceName);
+    valid.setNumPartitions(4);
+    valid.setStateModelDefRef("OnlineOffline");
+    valid.setRebalanceMode(IdealState.RebalanceMode.FULL_AUTO);
+    Entity entity = Entity.entity(OBJECT_MAPPER.writeValueAsString(valid.getRecord()),
+        MediaType.APPLICATION_JSON_TYPE);
+
+    try {
+      Response response = target("clusters/" + CLUSTER_NAME + "/resources/" + resourceName)
+          .request().put(entity);
+      Assert.assertEquals(response.getStatus(), Response.Status.OK.getStatusCode());
+
+      Assert.assertTrue(_gSetupTool.getClusterManagementTool().getResourcesInCluster(CLUSTER_NAME)
+          .contains(resourceName));
+    } finally {
+      if (_gSetupTool.getClusterManagementTool().getResourcesInCluster(CLUSTER_NAME)
+          .contains(resourceName)) {
+        _gSetupTool.getClusterManagementTool().dropResource(CLUSTER_NAME, resourceName);
+      }
+    }
     System.out.println("End test :" + TestHelper.getTestMethodName());
   }
 }
