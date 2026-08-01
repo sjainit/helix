@@ -26,6 +26,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import javax.ws.rs.DELETE;
 import javax.ws.rs.DefaultValue;
@@ -47,6 +48,9 @@ import org.apache.helix.ConfigAccessor;
 import org.apache.helix.HelixAdmin;
 import org.apache.helix.HelixException;
 import org.apache.helix.PropertyPathBuilder;
+import org.apache.helix.guardrail.GuardrailContext;
+import org.apache.helix.guardrail.GuardrailPipeline;
+import org.apache.helix.guardrail.rules.RequiredIdealStateFieldsGuardrailRule;
 import org.apache.helix.model.CustomizedView;
 import org.apache.helix.model.ExternalView;
 import org.apache.helix.model.HelixConfigScope;
@@ -240,7 +244,9 @@ public class ResourceAccessor extends AbstractHelixResource {
       @DefaultValue("DEFAULT") @QueryParam("rebalanceStrategy") String rebalanceStrategy,
       @DefaultValue("0") @QueryParam("bucketSize") int bucketSize,
       @DefaultValue("-1") @QueryParam("maxPartitionsPerInstance") int maxPartitionsPerInstance,
-      @DefaultValue("addResource") @QueryParam("command") String command, String content) {
+      @DefaultValue("addResource") @QueryParam("command") String command,
+      @DefaultValue("false") @QueryParam("force") boolean force,
+      @DefaultValue("false") @QueryParam("dryRun") boolean dryRun, String content) {
     // Get the command. If not provided, the default would be "addResource"
     Command cmd;
     try {
@@ -251,8 +257,10 @@ public class ResourceAccessor extends AbstractHelixResource {
     HelixAdmin admin = getHelixAdmin();
     try {
       switch (cmd) {
-      case addResource:
-        if (content.length() != 0) {
+      case addResource: {
+        IdealState proposedIdealState;
+        boolean fromContent = content.length() != 0;
+        if (fromContent) {
           ZNRecord record;
           try {
             record = toZNRecord(content);
@@ -261,14 +269,42 @@ public class ResourceAccessor extends AbstractHelixResource {
             return badRequest("Input is not a valid ZNRecord!");
           }
 
-          if (record.getSimpleFields() != null) {
-            admin.addResource(clusterId, resourceName, new IdealState(record));
+          if (record.getSimpleFields() == null) {
+            // Nothing to persist; preserve the original no-op behavior.
+            break;
           }
+          proposedIdealState = new IdealState(record);
+        } else {
+          // Mirror the required fields the query-param add path would persist so the same
+          // validation applies regardless of how the resource is specified.
+          proposedIdealState = new IdealState(resourceName);
+          proposedIdealState.setNumPartitions(numPartitions);
+          proposedIdealState.setStateModelDefRef(stateModelRef);
+        }
+
+        // Guard rail: block (or simulate) creating a resource whose IdealState omits a field that
+        // is unconditionally required to rebalance it (NUM_PARTITIONS, STATE_MODEL_DEF_REF), which
+        // would otherwise be written to ZooKeeper and only fail later at rebalance time. force=true
+        // overrides; dryRun=true only reports the verdict without writing.
+        GuardrailContext context = GuardrailContext.newBuilder(clusterId)
+            .dataAccessor(getDataAccssor(clusterId))
+            .proposedIdealState(proposedIdealState)
+            .build();
+        GuardrailPipeline pipeline =
+            new GuardrailPipeline(new RequiredIdealStateFieldsGuardrailRule());
+        Optional<Response> preflightResponse = preflight(pipeline, context, force, dryRun);
+        if (preflightResponse.isPresent()) {
+          return preflightResponse.get();
+        }
+
+        if (fromContent) {
+          admin.addResource(clusterId, resourceName, proposedIdealState);
         } else {
           admin.addResource(clusterId, resourceName, numPartitions, stateModelRef, rebalancerMode,
               rebalanceStrategy, bucketSize, maxPartitionsPerInstance);
         }
         break;
+      }
       case addWagedResource:
         // Check if content is valid
         if (content == null || content.length() == 0) {
