@@ -420,12 +420,24 @@ public class ResourceAccessor extends AbstractHelixResource {
       @PathParam("resourceName") String resourceName, @QueryParam("command") String command,
       @DefaultValue("-1") @QueryParam("replicas") int replicas,
       @DefaultValue("") @QueryParam("keyPrefix") String keyPrefix,
-      @DefaultValue("") @QueryParam("group") String group) {
+      @DefaultValue("") @QueryParam("group") String group,
+      @DefaultValue("false") @QueryParam("force") boolean force,
+      @DefaultValue("false") @QueryParam("dryRun") boolean dryRun) {
     Command cmd;
     try {
       cmd = Command.valueOf(command);
     } catch (Exception e) {
       return badRequest("Invalid command : " + command);
+    }
+
+    // force and dryRun are only honored by the 'disable' command, which runs the in-use guard rail
+    // pipeline. For any other command they are silently ignored and dryRun=true would still perform
+    // a real write -- the opposite of a simulation. Reject them up front for unsupported commands so
+    // callers are never misled into thinking a mutation was simulated or its violations overridden.
+    if ((force || dryRun) && cmd != Command.disable) {
+      return badRequest(String.format(
+          "The 'force' and 'dryRun' flags are only supported for the 'disable' command, not '%s'.",
+          command));
     }
 
     HelixAdmin admin = getHelixAdmin();
@@ -434,9 +446,23 @@ public class ResourceAccessor extends AbstractHelixResource {
       case enable:
         admin.enableResource(clusterId, resourceName, true);
         break;
-      case disable:
+      case disable: {
+        // Guard rail: disabling a resource tells the controller to tear down every placed replica,
+        // exactly like a drop -- so apply the same in-use check. If the external view still has
+        // replicas in any state other than DROPPED, block (or, with dryRun, simulate) the disable;
+        // force=true overrides the verdict.
+        GuardrailContext disableContext = GuardrailContext.newBuilder(clusterId)
+            .dataAccessor(getDataAccssor(clusterId))
+            .resourceName(resourceName)
+            .build();
+        Optional<Response> disablePreflight = preflight(
+            new GuardrailPipeline(new ResourceInUseGuardrailRule()), disableContext, force, dryRun);
+        if (disablePreflight.isPresent()) {
+          return disablePreflight.get();
+        }
         admin.enableResource(clusterId, resourceName, false);
         break;
+      }
       case rebalance:
         if (replicas == -1) {
           return badRequest("Number of replicas is needed for rebalancing!");
