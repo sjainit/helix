@@ -1085,6 +1085,98 @@ public class TestResourceAccessor extends AbstractTestClass {
   }
 
   /**
+   * Verifies the {@link ResourceInUseGuardrailRule} wired into the resource-disable path
+   * ({@code POST .../resources/{resource}?command=disable}). Disabling a resource tells the
+   * controller to tear down every placed replica, so -- exactly like a drop -- it is blocked while
+   * the external view still has non-DROPPED replicas unless the caller forces it. Also verifies that
+   * force/dryRun are rejected for commands other than disable.
+   */
+  @Test(dependsOnMethods = "testDeleteResourceInUseGuardrail")
+  public void testDisableResourceInUseGuardrail() throws Exception {
+    System.out.println("Start test :" + TestHelper.getTestMethodName());
+    String clusterName = "TestCluster_1";
+    String idleResource = clusterName + "_db_disguard_idle";
+    String inUseResource = clusterName + "_db_disguard_inuse";
+
+    Map<String, String> idealStateParams = new HashMap<>();
+    idealStateParams.put("MinActiveReplicas", "2");
+    idealStateParams.put("StateModelDefRef", "MasterSlave");
+    idealStateParams.put("MaxPartitionsPerInstance", "3");
+    idealStateParams.put("Replicas", "3");
+    idealStateParams.put("NumPartitions", "3");
+
+    // Disable the cluster so the controller neither removes the external views created below nor
+    // places new replicas while the guard rail is being exercised.
+    _gSetupTool.getClusterManagementTool().enableCluster(clusterName, false);
+    try {
+      // A resource whose every replica is DROPPED is not in use: the disable is certified feasible.
+      Map<String, List<String>> idleStates = new LinkedHashMap<>();
+      idleStates.put("p0", Arrays.asList("DROPPED", "DROPPED", "DROPPED"));
+      createDummyMapping(clusterName, idleResource, idealStateParams, idleStates);
+      _gSetupTool.getClusterManagementTool().enableResource(clusterName, idleResource, true);
+      post("clusters/" + clusterName + "/resources/" + idleResource,
+          ImmutableMap.of("command", "disable"), Entity.entity(null, MediaType.APPLICATION_JSON_TYPE),
+          Response.Status.OK.getStatusCode());
+      Assert.assertFalse(
+          _gSetupTool.getClusterManagementTool().getResourceIdealState(clusterName, idleResource)
+              .isEnabled(), "A resource with no placed replicas should disable normally");
+
+      // A resource with placed (non-DROPPED) replicas is in use.
+      Map<String, List<String>> inUseStates = new LinkedHashMap<>();
+      inUseStates.put("p0", Arrays.asList("MASTER", "SLAVE", "SLAVE"));
+      createDummyMapping(clusterName, inUseResource, idealStateParams, inUseStates);
+      _gSetupTool.getClusterManagementTool().enableResource(clusterName, inUseResource, true);
+
+      // force/dryRun are only valid for the 'disable' command; reject them for any other command
+      // so that dryRun=true can never be mistaken for a simulation of a real mutation.
+      post("clusters/" + clusterName + "/resources/" + inUseResource,
+          ImmutableMap.of("command", "enable", "force", "true"),
+          Entity.entity(null, MediaType.APPLICATION_JSON_TYPE),
+          Response.Status.BAD_REQUEST.getStatusCode());
+
+      // 1) Enforcement: blocked with 400 + an infeasible verdict naming the rule; still enabled.
+      Response blocked = post("clusters/" + clusterName + "/resources/" + inUseResource,
+          ImmutableMap.of("command", "disable"), Entity.entity(null, MediaType.APPLICATION_JSON_TYPE),
+          Response.Status.BAD_REQUEST.getStatusCode(), true);
+      JsonNode blockedVerdict = OBJECT_MAPPER.readTree(blocked.readEntity(String.class));
+      Assert.assertFalse(blockedVerdict.get("feasible").asBoolean());
+      Assert.assertTrue(blockedVerdict.toString().contains(ResourceInUseGuardrailRule.RULE_ID));
+      Assert.assertTrue(
+          _gSetupTool.getClusterManagementTool().getResourceIdealState(clusterName, inUseResource)
+              .isEnabled(),
+          "An in-use resource must not be disabled when the guard rail blocks it");
+
+      // 2) Dry-run: 200 with the same infeasible verdict, still enabled.
+      Response dryRun = post("clusters/" + clusterName + "/resources/" + inUseResource,
+          ImmutableMap.of("command", "disable", "dryRun", "true"),
+          Entity.entity(null, MediaType.APPLICATION_JSON_TYPE), Response.Status.OK.getStatusCode(),
+          true);
+      JsonNode dryRunVerdict = OBJECT_MAPPER.readTree(dryRun.readEntity(String.class));
+      Assert.assertFalse(dryRunVerdict.get("feasible").asBoolean());
+      Assert.assertTrue(
+          _gSetupTool.getClusterManagementTool().getResourceIdealState(clusterName, inUseResource)
+              .isEnabled(), "dryRun must not disable the resource");
+
+      // 3) force=true overrides the guard rail: the in-use resource is actually disabled.
+      post("clusters/" + clusterName + "/resources/" + inUseResource,
+          ImmutableMap.of("command", "disable", "force", "true"),
+          Entity.entity(null, MediaType.APPLICATION_JSON_TYPE), Response.Status.OK.getStatusCode());
+      Assert.assertFalse(
+          _gSetupTool.getClusterManagementTool().getResourceIdealState(clusterName, inUseResource)
+              .isEnabled(), "force=true must override the guard rail and disable the resource");
+    } finally {
+      for (String resource : Arrays.asList(idleResource, inUseResource)) {
+        try {
+          _gSetupTool.getClusterManagementTool().dropResource(clusterName, resource);
+        } catch (Exception ignored) {
+        }
+      }
+      _gSetupTool.getClusterManagementTool().enableCluster(clusterName, true);
+    }
+    System.out.println("End test :" + TestHelper.getTestMethodName());
+  }
+
+  /**
    * Creates a setup where the health API can be tested.
    * @param clusterName
    * @param resourceName
